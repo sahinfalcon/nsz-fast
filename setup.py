@@ -54,6 +54,7 @@ def get_setup_kwargs():
         ],
         "install_requires": [
             "pycryptodome",
+            "cryptography",
             "zstandard",
             "enlighten",
         ],

@@ -13,6 +13,14 @@ except ModuleNotFoundError as e:
         Print.info("Error: Unable to find 'Crypto' or 'Cryptodome' modules. Please install pycryptodome pip package.")
         raise e
 
+try:
+    # Optional: OpenSSL-backed AES-CTR is roughly 10x faster than pycryptodome's
+    from cryptography.hazmat.primitives.ciphers import Cipher as _OsslCipher
+    from cryptography.hazmat.primitives.ciphers import algorithms as _ossl_algorithms
+    from cryptography.hazmat.primitives.ciphers import modes as _ossl_modes
+except ImportError:
+    _OsslCipher = None
+
 BLOCK_SIZE = 0x10
 
 
@@ -129,15 +137,26 @@ class AESCTR:
         self.seek(offset)
 
     def encrypt(self, data: bytes, ctr=None) -> bytes:
-        return self.aes.encrypt(data)
+        return self._crypt(data)
 
     def decrypt(self, data: bytes, ctr=None) -> bytes:
         return self.encrypt(data, ctr)
 
     def _new_ctr_cipher(self, prefix: bytes, offset: int):
+        skip = offset & 0xF
+        if _OsslCipher is not None:
+            # Same keystream as Counter.new(64, prefix=prefix): 8-byte prefix || 64-bit big-endian block index
+            iv = bytes(prefix) + (offset >> 4).to_bytes(8, "big")
+            cipher = _OsslCipher(
+                _ossl_algorithms.AES(bytes(self.key)), _ossl_modes.CTR(iv)
+            ).encryptor()
+            self._crypt = cipher.update
+            if skip:
+                cipher.update(b"\x00" * skip)
+            return None, cipher
         ctr = Counter.new(64, prefix=prefix, initial_value=(offset >> 4))
         cipher = AES.new(self.key, AES.MODE_CTR, counter=ctr)
-        skip = offset & 0xF
+        self._crypt = cipher.encrypt
         if skip:
             cipher.encrypt(b"\x00" * skip)
         return ctr, cipher
