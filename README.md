@@ -1,4 +1,39 @@
-[![Build Release Binaries](https://github.com/nicoboss/nsz/actions/workflows/build-release.yml/badge.svg)](https://github.com/nicoboss/nsz/actions/workflows/build-release.yml)
+# nsz-fast
+
+A faster fork of [nicoboss/nsz](https://github.com/nicoboss/nsz). Same commands, flags and defaults, and **byte-identical output**: it just gets there sooner.
+
+| 4.33 GB game, Apple M4 | nsz | nsz-fast | |
+| --- | --- | --- | --- |
+| Compress + verify (`-C -V`, solid, level 18) | 202 s | 141 s | 1.4× |
+| Block compress + verify (`-B -C -V`) | 91 s | 70 s | 1.3× |
+| Verify (`-V`) | 17.0 s | 4.5 s | 3.8× |
+| Decompress (`-D`) | 19.0 s | 20.8 s | same, both limited by the disk's write speed |
+
+At level 18 almost all of compression is zstd's own work, so the gain there comes from using every core (the M4 has 4 fast and 6 efficiency cores). Verify and decompress were held back by nsz's own pipeline, which is where the big gains are.
+
+### What's different
+
+- Verify and decompress run as a parallel pipeline (a reader thread, a thread pool for zstd and AES, in-order hashing and writing) instead of one thread working in 64 KiB steps.
+- AES-CTR uses OpenSSL through the `cryptography` package (about 10× faster than pycryptodome), with pycryptodome as the fallback.
+- Block compression uses a thread pool instead of worker processes talking through a multiprocessing Manager.
+- Solid compression uses all CPU cores by default (shared between `--multi` tasks) instead of 3.
+- Fixes: `-s 28` and above no longer hang (the maximum is now 31), and a failed block compression no longer reports success.
+
+### Checking the output yourself
+
+```
+python3 scripts/compare_upstream.py --keys ~/.switch/prod.keys game.nsp
+```
+
+This runs upstream nsz and nsz-fast on the same file (solid, verify, decompress, block), compares SHA-256 of every output, checks that decompressing reproduces the original file, and prints both timings. It exits non-zero on any difference.
+
+Unit tests (no keys or games needed): `python3 -m unittest discover -s tests -t .`
+
+To use nsz-fast, run it from source: `pip3 install -r requirements.txt`, then `python3 nsz.py`. The release binaries and PyPI package mentioned below are upstream's.
+
+All credit for NSZ goes to Nico Bosshard and its contributors. MIT licensed, like upstream. The upstream README follows.
+
+---
 
 # NSZ
 
