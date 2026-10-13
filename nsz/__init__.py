@@ -175,7 +175,8 @@ def compress(filePath, outputDir, args, work, amountOfTaskQueued):
             outputDir,
             threadsToUseForBlockCompression,
         )
-        assert outFile is not None
+        if outFile is None:
+            raise Exception("Compression failed. Output file was not created.")
         if args.verify:
             Print.info("{0}".format(outFile), "VERIFY NSZ")
             try:

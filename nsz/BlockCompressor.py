@@ -1,41 +1,35 @@
 import sys
+import threading
 from nsz.nut import Keys, Print
-from time import sleep
 from traceback import format_exc
 from zstandard import ZstdCompressionParameters, ZstdCompressor
 from nsz.SectionFs import isNcaPacked, sortedFs
-from multiprocessing import Process, Manager
 from nsz.Fs import Pfs0, Hfs0, Nca, Nsp, Type, Xci
+from nsz import Pipeline
 import enlighten
 
-if hasattr(sys, "getandroidapilevel"):
-    from nsz.ThreadSafeCounterManager import Counter
-else:
-    from nsz.ThreadSafeCounterSharedMemory import Counter
+MAX_BYTES_IN_FLIGHT = 0x20000000
 
 
-def compressBlockTask(in_queue, out_list, readyForWork, pleaseKillYourself, blockSize):
-    while True:
-        readyForWork.increment()
-        item = in_queue.get()
-        # readyForWork.decrement() # https://github.com/nicoboss/nsz/issues/80
-        if pleaseKillYourself.value() > 0:
-            break
-        buffer, compressionLevel, useLongDistanceMode, chunkRelativeBlockID = item
-        if buffer == 0:
-            return
+def makeBlockCompressor(compressionLevel, useLongDistanceMode, blockSize):
+    # Runs on pipeline threads; python-zstandard releases the GIL while compressing
+    local = threading.local()
+
+    def compressBlock(buffer):
         if (
             compressionLevel == 0 and len(buffer) == blockSize
         ):  # https://github.com/nicoboss/nsz/issues/79
-            out_list[chunkRelativeBlockID] = buffer
-        else:
+            return len(buffer), buffer
+        cctx = getattr(local, "cctx", None)
+        if cctx is None:
             params = ZstdCompressionParameters.from_level(
                 compressionLevel, enable_ldm=useLongDistanceMode
             )
-            compressed = ZstdCompressor(compression_params=params).compress(buffer)
-            out_list[chunkRelativeBlockID] = (
-                compressed if len(compressed) < len(buffer) else buffer
-            )
+            cctx = local.cctx = ZstdCompressor(compression_params=params)
+        compressed = cctx.compress(buffer)
+        return len(buffer), compressed if len(compressed) < len(buffer) else buffer
+
+    return compressBlock
 
 
 def blockCompress(
@@ -97,26 +91,13 @@ def blockCompressContainer(
     # When the caller polls a statusReport dict, skip the enlighten bars entirely
     useBars = statusReport is None and not machineReadableOutput and not minimalOutput
 
-    if blockSizeExponent < 14 or blockSizeExponent > 32:
-        raise ValueError("Block size must be between 14 and 32")
+    # Each compressed block size is stored as a u32, so a raw 2^32 byte block can't be represented
+    if blockSizeExponent < 14 or blockSizeExponent > 31:
+        raise ValueError("Block size must be between 14 and 31")
     blockSize = 2**blockSizeExponent
-    manager = Manager()
-    results = manager.list()
-    readyForWork = Counter(manager, 0)
-    pleaseKillYourself = Counter(manager, 0)
-    TasksPerChunk = 209715200 // blockSize
-    for i in range(TasksPerChunk):
-        results.append(b"")
-    pool = []
-    work = manager.Queue(threads)
-
-    for i in range(threads):
-        p = Process(
-            target=compressBlockTask,
-            args=(work, results, readyForWork, pleaseKillYourself, blockSize),
-        )
-        p.start()
-        pool.append(p)
+    compressBlock = makeBlockCompressor(compressionLevel, useLongDistanceMode, blockSize)
+    window = max(2, min(2 * threads, MAX_BYTES_IN_FLIGHT // blockSize))
+    threads = min(threads, window)
 
     bar = None
     writtenBar = None
@@ -172,9 +153,6 @@ def blockCompressContainer(
                     sections += fs.getEncryptionSections()
 
                 if len(sections) == 0:
-                    for p in pool:
-                        # Process.terminate() might corrupt the data structure but we don't care
-                        p.terminate()
                     raise Exception("NCA can't be decrypted. Outdated keys.txt?")
                 header = b"NCZSECTN"
                 header += len(sections).to_bytes(8, "little")
@@ -215,8 +193,6 @@ def blockCompressContainer(
 
                 f.write(header)
                 blockID = 0
-                chunkRelativeBlockID = 0
-                startChunkBlockID = 0
                 blocksHeaderFilePos = f.tell()
                 bytesToCompress = nspf.size - INCOMPRESSIBLE_HEADER_SIZE
                 blocksToCompress = bytesToCompress // blockSize + (
@@ -290,7 +266,6 @@ def blockCompressContainer(
                 if INCOMPRESSIBLE_HEADER_SIZE - offsetFirstSection > 0:
                     partitions[0].seek(INCOMPRESSIBLE_HEADER_SIZE - offsetFirstSection)
 
-                partNr = 0
                 decompressedBytesOld = nspf.tell() // 1048576
 
                 if useBars:
@@ -300,42 +275,30 @@ def blockCompressContainer(
                     bar.refresh()
                     writtenBar.refresh()
 
-                while True:
-                    buffer = partitions[partNr].read(blockSize)
-                    while len(buffer) < blockSize and partNr < len(partitions) - 1:
-                        partitions[partNr].close()
-                        partitions[partNr] = None
-                        partNr += 1
-                        buffer += partitions[partNr].read(blockSize - len(buffer))
-                    if chunkRelativeBlockID >= TasksPerChunk or len(buffer) == 0:
-                        while readyForWork.value() < threads:
-                            sleep(0.02)
-
-                        for i in range(
-                            min(TasksPerChunk, blocksToCompress - startChunkBlockID)
-                        ):
-                            lenResult = len(results[i])
-                            compressedBytes += lenResult
-                            compressedblockSizeList[startChunkBlockID + i] = lenResult
-                            f.write(results[i])
-                            results[i] = b""
-
+                def readBlocks(partitions=partitions):
+                    # Runs on the pipeline's feeder thread so reading/decrypting overlaps compression
+                    partNr = 0
+                    while True:
+                        buffer = partitions[partNr].read(blockSize)
+                        while len(buffer) < blockSize and partNr < len(partitions) - 1:
+                            partitions[partNr].close()
+                            partitions[partNr] = None
+                            partNr += 1
+                            buffer += partitions[partNr].read(blockSize - len(buffer))
                         if len(buffer) == 0:
                             break
-                        chunkRelativeBlockID = 0
-                        startChunkBlockID = blockID
-                    work.put(
-                        [
-                            buffer,
-                            compressionLevel,
-                            useLongDistanceMode,
-                            chunkRelativeBlockID,
-                        ]
-                    )
-                    readyForWork.decrement()
+                        yield buffer
+                    partitions[partNr].close()
+                    partitions[partNr] = None
+
+                for inputLength, result in Pipeline.orderedMap(
+                    compressBlock, readBlocks(), threads, window
+                ):
+                    f.write(result)
+                    compressedBytes += len(result)
+                    compressedblockSizeList[blockID] = len(result)
                     blockID += 1
-                    chunkRelativeBlockID += 1
-                    decompressedBytes += len(buffer)
+                    decompressedBytes += inputLength
                     if (
                         decompressedBytes - decompressedBytesOld > 10485760
                     ):  # Refresh every 10 MB
@@ -351,10 +314,7 @@ def blockCompressContainer(
                             writtenBar.refresh()
                         else:
                             reportProgress(compressedBytes, nspf.size)
-
-                    sys.stdout.flush()
-                partitions[partNr].close()
-                partitions[partNr] = None
+                        sys.stdout.flush()
                 endPos = f.tell()
                 written = endPos - startPos
 
@@ -370,12 +330,12 @@ def blockCompressContainer(
                     reportProgress(written, written)
 
                 f.seek(blocksHeaderFilePos + 24)
-                header = b""
-
-                for compressedblockSize in compressedblockSizeList:
-                    header += compressedblockSize.to_bytes(4, "little")
-
-                f.write(header)
+                f.write(
+                    b"".join(
+                        compressedblockSize.to_bytes(4, "little")
+                        for compressedblockSize in compressedblockSizeList
+                    )
+                )
                 f.seek(endPos)  # Seek to end of file.
                 Print.info(
                     "compressed %d%% %d -> %d  - %s"
@@ -395,18 +355,6 @@ def blockCompressContainer(
         while not nspf.eof():
             buffer = nspf.read(CHUNK_SZ)
             f.write(buffer)
-
-    # Ensures that all threads are started and completed before being requested to quit
-    while readyForWork.value() < threads:
-        sleep(0.02)
-    pleaseKillYourself.increment()
-
-    for i in range(readyForWork.value()):
-        work.put(None)
-        readyForWork.decrement()
-
-    while readyForWork.value() > 0:
-        sleep(0.02)
 
     if barManager is not None:
         barManager.stop()
@@ -433,6 +381,7 @@ def blockCompressNsp(
         f"Block compressing (level {compressionLevel}{' ldm' if useLongDistanceMode else ''}) {filePath} -> {nszPath}"
     )
 
+    failed = False
     try:
         with Pfs0.Pfs0Stream(
             container.getPaddedHeaderSize()
@@ -458,12 +407,15 @@ def blockCompressNsp(
     except BaseException as ex:
         if isinstance(ex, Keys.MissingKeyError):
             raise
+        failed = True
         if not isinstance(ex, KeyboardInterrupt):
             Print.error(200, format_exc())
         if nszPath.is_file():
             nszPath.unlink()
 
     container.close()
+    if failed:
+        return None
     return nszPath
 
 
@@ -492,6 +444,7 @@ def blockCompressXci(
         f"Block compressing (level {compressionLevel}{' ldm' if useLongDistanceMode else ''}) {filePath} -> {xczPath}"
     )
 
+    failed = False
     try:
         # need filepath to copy XCI container settings
         assert container.hfs0 is not None
@@ -525,10 +478,13 @@ def blockCompressXci(
     except BaseException as ex:
         if isinstance(ex, Keys.MissingKeyError):
             raise
+        failed = True
         if not isinstance(ex, KeyboardInterrupt):
             Print.error(201, format_exc())
         if xczPath.is_file():
             xczPath.unlink()
 
     container.close()
+    if failed:
+        return None
     return xczPath

@@ -41,7 +41,7 @@ class ParseArguments:
             "--bs",
             type=int,
             default=20,
-            help="Block Size for random read access 2^x while x between 14 and 32. Default: 20 => 1 MB",
+            help="Block Size for random read access 2^x while x between 14 and 31. Default: 20 => 1 MB",
         )
         parser.add_argument(
             "-V",
