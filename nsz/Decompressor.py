@@ -5,9 +5,16 @@ from nsz.nut import Print, aes128
 from zstandard import ZstdDecompressor
 from nsz.Fs import factory, Pfs0, Hfs0, Nsp, Xci
 from nsz.PathTools import changeExtension, isCompressedGameFile, isNspNsz, isXciXcz
-from nsz import Header, BlockDecompressorReader, FileExistingChecks
+from nsz import Header, FileExistingChecks, Pipeline
 import os
+import threading
 import enlighten
+
+SOLID_CHUNK_SZ = 0x400000
+# SHA-256 of the output is inherently serial (~2.5 GB/s), a few decompression threads saturate it
+DECOMPRESS_THREADS = 4
+MAX_BYTES_IN_FLIGHT = 0x10000000
+REPORT_EVERY = 0x2000000
 
 
 class VerificationException(Exception):
@@ -280,6 +287,81 @@ def __getDecompressedNczSize(nspf):
     return nca_size
 
 
+def __streamPieces(sections, incompressibleHeaderSize):
+    # Maps the decompressed stream onto the NCA: (streamStart, streamEnd, ncaOffset, section)
+    pieces = []
+    streamPos = 0
+    for i, s in enumerate(sections):
+        start = s.offset
+        if i == 0 and incompressibleHeaderSize - s.offset > 0:
+            start += incompressibleHeaderSize - s.offset
+        end = s.offset + s.size
+        if end > start:
+            pieces.append((streamPos, streamPos + end - start, start, s))
+            streamPos += end - start
+    return pieces
+
+
+def __reencrypt(pieces, streamOffset, data):
+    # CTR is seekable, so any slice of the stream can be re-encrypted independently
+    streamEnd = streamOffset + len(data)
+    view = memoryview(data)
+    out = []
+    for pieceStart, pieceEnd, ncaOffset, s in pieces:
+        lo = max(pieceStart, streamOffset)
+        hi = min(pieceEnd, streamEnd)
+        if lo >= hi:
+            continue
+        part = view[lo - streamOffset : hi - streamOffset]
+        if s.cryptoType in (3, 4):
+            part = aes128.AESCTR(
+                s.cryptoKey, s.cryptoCounter, ncaOffset + lo - pieceStart
+            ).encrypt(part)
+        out.append(part)
+    if len(out) == 1 and len(out[0]) == len(data):
+        return out[0] if isinstance(out[0], bytes) else data
+    return b"".join(out)
+
+
+def __readBlocks(nspf, blockHeader):
+    # Runs on the pipeline's feeder thread: sequential reads only, decompression happens in the pool
+    if blockHeader.blockSizeExponent < 14 or blockHeader.blockSizeExponent > 32:
+        raise ValueError(
+            "Corrupted NCZBLOCK header: Block size must be between 14 and 32"
+        )
+    blockSize = 2**blockHeader.blockSizeExponent
+    sizes = blockHeader.compressedBlockSizeList
+    compressedOffset = nspf.tell()
+    streamOffset = 0
+    for blockID, compressedSize in enumerate(sizes):
+        decompressedBlockSize = blockSize
+        if blockID == len(sizes) - 1:
+            remainder = blockHeader.decompressedSize % blockSize
+            # https://github.com/nicoboss/nsz/issues/210
+            if remainder > 0:
+                decompressedBlockSize = remainder
+        nspf.seek(compressedOffset)
+        if compressedSize < decompressedBlockSize:
+            yield streamOffset, nspf.read(compressedSize), True
+        else:
+            yield streamOffset, nspf.read(decompressedBlockSize), False
+        compressedOffset += compressedSize
+        streamOffset += decompressedBlockSize
+
+
+def __readSolid(nspf, chunkSize):
+    # A solid NCZ is one zstd frame, so decoding is serial; it runs on the feeder thread
+    # while re-encryption, hashing and writing proceed in parallel
+    reader = ZstdDecompressor().stream_reader(nspf, read_size=chunkSize)
+    streamOffset = 0
+    while True:
+        chunk = reader.read(chunkSize)
+        if not chunk:
+            return
+        yield streamOffset, chunk, False
+        streamOffset += len(chunk)
+
+
 def __decompressNcz(
     nspf,
     f,
@@ -319,17 +401,15 @@ def __decompressNcz(
     blockMagic = nspf.read(8)
     nspf.seek(pos)
     useBlockCompression = blockMagic == b"NCZBLOCK"
-    blockDecompressorReader = None
     if useBlockCompression:
         Print.info(f"Using Block decompression for {nspf._path}", "NCZBLOCK")
         BlockHeader = Header.Block(nspf)
-        blockDecompressorReader = BlockDecompressorReader.BlockDecompressorReader(
-            nspf, BlockHeader
-        )
-    pos = nspf.tell()
-    decompressor = None
-    if not useBlockCompression:
-        decompressor = ZstdDecompressor().stream_reader(nspf)
+        chunkSize = 2**BlockHeader.blockSizeExponent
+        streamChunks = __readBlocks(nspf, BlockHeader)
+    else:
+        chunkSize = SOLID_CHUNK_SZ
+        streamChunks = __readSolid(nspf, chunkSize)
+    pieces = __streamPieces(sections, INCOMPRESSIBLE_HEADER_SIZE)
     hash = sha256()
 
     def reportProgress(processed):
@@ -406,54 +486,38 @@ def __decompressNcz(
             reportProgress(decompressedBytes)
     hash.update(header)
 
-    firstSection = True
-    for s in sections:
-        i = s.offset
-        useCrypto = s.cryptoType in (3, 4)
-        crypto = None
-        if useCrypto:
-            assert isinstance(s, Header.Section)
-            crypto = aes128.AESCTR(s.cryptoKey, s.cryptoCounter)
-        end = s.offset + s.size
-        if firstSection:
-            firstSection = False
-            uncompressedSize = INCOMPRESSIBLE_HEADER_SIZE - sections[0].offset
-            if uncompressedSize > 0:
-                i += uncompressedSize
-        while i < end:
-            if useCrypto:
-                assert crypto is not None
-                crypto.seek(i)
-            chunkSz = 0x10000 if end - i > 0x10000 else end - i
-            if useBlockCompression:
-                assert blockDecompressorReader is not None
-                inputChunk = blockDecompressorReader.read(chunkSz)
-            else:
-                assert decompressor is not None
-                inputChunk = decompressor.read(chunkSz)
-            if not len(inputChunk):
-                break
-            if useCrypto:
-                assert crypto is not None
-                inputChunk = crypto.encrypt(inputChunk)
-            if f is not None:
-                f.write(inputChunk)
-            hash.update(inputChunk)
-            lenInputChunk = len(inputChunk)
-            i += lenInputChunk
-            decompressedBytes += lenInputChunk
+    threads = Pipeline.workerThreads(DECOMPRESS_THREADS)
+    window = max(2, min(2 * threads, MAX_BYTES_IN_FLIGHT // chunkSize))
+    localDecompressor = threading.local()
+
+    def transform(item):
+        streamOffset, data, isCompressed = item
+        if isCompressed:
+            dctx = getattr(localDecompressor, "dctx", None)
+            if dctx is None:
+                dctx = localDecompressor.dctx = ZstdDecompressor()
+            data = dctx.decompress(data)
+        return __reencrypt(pieces, streamOffset, data)
+
+    for outputChunk in Pipeline.orderedMap(transform, streamChunks, threads, window):
+        if not outputChunk:
+            break
+        if f is not None:
+            f.write(outputChunk)
+        hash.update(outputChunk)
+        decompressedBytes += len(outputChunk)
+        if decompressedBytes - decompressedBytesOld > REPORT_EVERY:
+            decompressedBytesOld = decompressedBytes
             if statusReportInfo is not None:
                 assert statusReport is not None
+                # Manager-backed list: every access is an IPC round trip, so only update periodically
                 statusReport[id] = [
-                    statusReport[id][0] + chunkSz,
+                    decompressedBytes,
                     statusReport[id][1],
                     nca_size,
                     currentStep,
                 ]
-            elif (
-                decompressedBytes - decompressedBytesOld > 52428800
-            ):  # Refresh every 50 MB
-                decompressedBytesOld = decompressedBytes
+            else:
                 if not Print.isMinimalOutput() and not Print.machineReadableOutput:
                     assert bar is not None and writtenBar is not None
                     bar.count = nspf.tell() // 1048576
@@ -463,7 +527,10 @@ def __decompressNcz(
                 else:
                     reportProgress(decompressedBytes)
 
-    if statusReportInfo is None:
+    if statusReportInfo is not None:
+        assert statusReport is not None
+        statusReport[id] = [decompressedBytes, statusReport[id][1], nca_size, currentStep]
+    else:
         if not Print.isMinimalOutput() and not Print.machineReadableOutput:
             assert bar is not None and writtenBar is not None
             bar.count = bar.total
