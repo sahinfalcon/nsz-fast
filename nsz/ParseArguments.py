@@ -83,7 +83,7 @@ class ParseArguments:
             "--threads",
             type=int,
             default=-1,
-            help="Number of threads to compress with. Numbers < 1 corresponds to the number of logical CPU cores for block compression and 3 for solid compression",
+            help="Number of threads to compress with. Numbers < 1 corresponds to the number of logical CPU cores (shared between --multi tasks for solid compression)",
         )
         parser.add_argument(
             "-m",

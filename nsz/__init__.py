@@ -63,9 +63,12 @@ def solidCompressTask(
     id,
     problemQueue,
     keysPath,
+    parallelTasks=1,
 ):
     if not Keys.keys_loaded:
         Keys.load_default(keysPath)
+    # Auto thread count: share the machine's cores between the parallel solid tasks
+    autoThreads = max(1, cpu_count() // max(1, parallelTasks))
     while True:
         readyForWork.increment()
         item = in_queue.get()
@@ -84,6 +87,8 @@ def solidCompressTask(
                 verifyArg,
                 quickVerify,
             ) = item
+            if threadsToUse < 1:
+                threadsToUse = autoThreads
             outFile = solidCompress(
                 filePath,
                 compressionLevel,
@@ -193,7 +198,8 @@ def compress(filePath, outputDir, args, work, amountOfTaskQueued):
                 remove(outFile)
                 raise
     else:
-        threadsToUseForSolidCompression = args.threads if args.threads > 0 else 3
+        # 0 = let the solid worker use its share of the CPU cores
+        threadsToUseForSolidCompression = args.threads if args.threads > 0 else 0
         work.put(
             [
                 filePath,
@@ -437,6 +443,7 @@ def _start_compression_workers(
                 i,
                 problems,
                 keysPath,
+                parallelTasks,
             ),
         )
         p.start()
